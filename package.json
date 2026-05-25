@@ -1,0 +1,23 @@
+{
+  "name": "@thefactoryorg/company-os-module-forge-t1",
+  "version": "0.0.1",
+  "description": "Forge T1 — Risk-Tier 1 simple solutions factory for Company OS.",
+  "type": "module",
+  "main": "dist/tools.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
