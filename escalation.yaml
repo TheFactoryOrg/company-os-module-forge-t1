@@ -1,0 +1,33 @@
+rules:
+  # Boundary actions — J&J
+  create_github_repo:
+    requires: [J&J]
+    timeout_minutes: 1440
+    timeout_behavior: escalate
+
+  build_continue:
+    requires: [J&J]
+    timeout_minutes: 4320
+    timeout_behavior: escalate
+
+  build_cancel:
+    requires: [J&J]
+    timeout_minutes: 4320
+    timeout_behavior: escalate
+
+  # Internal loop tools — inform
+  scaffold_solution_repo:      { tier: inform }
+  query_feature_catalog:       { tier: inform }
+  pull_feature:                { tier: inform }
+  commit_to_solution:          { tier: inform }
+  propose_feature_promotion:   { tier: inform }
+  run_quality_checks:          { tier: inform }
+  run_security_scan:           { tier: inform }
+  configure_ci_cd:             { tier: inform }
+  provision_vercel_env:        { tier: inform }
+  attach_custom_domain:        { tier: inform }
+  run_critic_evaluation:       { tier: inform }
+  run_e2e_test:                { tier: inform }
+  record_verdict:              { tier: inform }
+  request_continue_or_cancel:  { tier: inform }
+  publish_build_ready:         { tier: inform }

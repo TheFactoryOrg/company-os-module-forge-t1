@@ -1,0 +1,22 @@
+id: forge-t1
+name: Forge T1 (Simple Solutions Factory)
+description: |
+  Risk-Tier 1 factory. Receives feasibility-green plans from the Planning
+  module via the Forge Dispatcher and builds Next.js + edge-function
+  solutions (no persistence). Six-persona iterate-to-fixed-point loop
+  (Builder, Quality, Security, CI/CD, Critic, Tester) with
+  max_iterations=10 and a J&J gate when the iteration cap is hit.
+
+active: true
+
+subscriptions:
+  - "forge_t1.build.requested"
+
+credentials:
+  - GITHUB_TOKEN
+  - VERCEL_API_TOKEN
+  - VERCEL_ORG_ID
+
+agent:
+  model: claude-sonnet-4-6
+  max_turns: 120

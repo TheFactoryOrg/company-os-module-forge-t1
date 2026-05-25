@@ -1,0 +1,2 @@
+# Forge T1 is event-driven only — no scheduled routines.
+routines: []
