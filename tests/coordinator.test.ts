@@ -43,7 +43,9 @@ function makeContext(): {
       preview_url TEXT,
       pending_escalation_id INTEGER,
       cost_usd_cap REAL,
-      persona_started_at TEXT
+      persona_started_at TEXT,
+      last_sandbox_status TEXT,
+      last_sandbox_error TEXT
     );
     CREATE TABLE forge_verdicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +285,46 @@ describe('ForgeT1Coordinator', () => {
     expect(env.published.map(p => p.type)).toContain('forge_t1.iteration.completed');
     expect(env.published.map(p => p.type)).toContain('forge_t1.iteration.started');
     expect(env.published.map(p => p.type)).toContain('forge_t1.persona.builder.requested');
+  });
+
+  it('runWatchdogSweep synthesizes pass:false for stuck personas', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    // Force persona_started_at into the past (>15 min ago).
+    env.db.prepare("UPDATE forge_runs SET persona_started_at = datetime('now', '-16 minutes'), current_stage = 'builder' WHERE id = ?").run(runId);
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    const synth = env.published.find(p => p.type === 'forge_t1.verdict.recorded');
+    expect(synth).toBeTruthy();
+    expect((synth!.payload as { pass: boolean }).pass).toBe(false);
+    expect((synth!.payload as { verdict: { notes: string } }).verdict.notes).toBe('watchdog_timeout');
+  });
+
+  it('runWatchdogSweep emits secrets_timeout for builds stuck in ready_pending_secrets >24h (S5)', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.db.prepare(
+      "UPDATE forge_runs SET status = 'ready_pending_secrets', ready_pending_secrets_at = datetime('now', '-25 hours') WHERE id = ?"
+    ).run(runId);
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    const evt = env.published.find(p => p.type === 'forge_t1.build.secrets_timeout');
+    expect(evt).toBeTruthy();
+    expect((evt!.payload as { run_id: number }).run_id).toBe(runId);
+  });
+
+  it('runWatchdogSweep does NOT emit secrets_timeout for fresh ready_pending_secrets (S5)', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.db.prepare(
+      "UPDATE forge_runs SET status = 'ready_pending_secrets', ready_pending_secrets_at = datetime('now', '-1 hours') WHERE id = ?"
+    ).run(runId);
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    expect(env.published.find(p => p.type === 'forge_t1.build.secrets_timeout')).toBeUndefined();
   });
 
   it('pauses with cost_exceeded when summed agent_runs cost > cap', () => {

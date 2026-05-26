@@ -8,6 +8,7 @@ import { PERSONA_SEQUENCE } from '../types.js';
 
 export interface Coordinator {
   start(): void;
+  runWatchdogSweep(): void;
 }
 
 /**
@@ -207,7 +208,7 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     }
 
     if (persona === 'tester') {
-      db.prepare("UPDATE forge_runs SET status = 'running:promotion_review', current_stage = 'promotion_review' WHERE id = ?").run(run.id);
+      db.prepare("UPDATE forge_runs SET status = 'running:promotion_review', current_stage = 'promotion_review', persona_started_at = datetime('now') WHERE id = ?").run(run.id);
       bus.publish('forge_t1.iteration.completed', moduleId, { run_id: run.id, iteration, pass: true });
       bus.publish('forge_t1.persona.promotion_review.requested', moduleId, { run_id: run.id, experiment_id: run.experiment_id });
       return;
@@ -216,7 +217,7 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     const idx = PERSONA_SEQUENCE.indexOf(persona);
     const next = PERSONA_SEQUENCE[idx + 1];
     if (!next) return;
-    db.prepare("UPDATE forge_runs SET status = ?, current_stage = ? WHERE id = ?").run(`running:${next}`, next, run.id);
+    db.prepare("UPDATE forge_runs SET status = ?, current_stage = ?, persona_started_at = datetime('now') WHERE id = ?").run(`running:${next}`, next, run.id);
     bus.publish(`forge_t1.persona.${next}.requested`, moduleId, { run_id: run.id, experiment_id: run.experiment_id, iteration });
   }
 
@@ -249,7 +250,7 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
 
   function enterBuilderIteration(runId: number, iter: number): void {
     db.prepare(
-      "UPDATE forge_runs SET status = 'running:builder', current_stage = 'builder', iteration_count = ? WHERE id = ?"
+      "UPDATE forge_runs SET status = 'running:builder', current_stage = 'builder', iteration_count = ?, persona_started_at = datetime('now'), last_sandbox_status = NULL, last_sandbox_error = NULL WHERE id = ?"
     ).run(iter, runId);
     bus.publish('forge_t1.iteration.started', moduleId, { run_id: runId, iteration: iter });
     bus.publish('forge_t1.persona.builder.requested', moduleId, { run_id: runId, iteration: iter });
@@ -361,5 +362,78 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     return typeof v === 'number' && Number.isFinite(v) ? v : 0;
   }
 
-  return { start };
+  /**
+   * Scans for personas stuck > 15 minutes (no record_verdict published).
+   * For each stuck row, synthesize a forge_t1.verdict.recorded with
+   * pass:false; the existing handleVerdictRecorded path will fail the
+   * iteration (and either restart or paused:maxiter).
+   *
+   * Also sweeps for builds stuck in ready_pending_secrets > 24h (S5/N6 from
+   * v2 dry-run): emits forge_t1.build.secrets_timeout + J&J via build_continue.
+   */
+  function runWatchdogSweep(): void {
+    const stuck = db.prepare(
+      `SELECT id, current_stage, iteration_count, persona_started_at
+         FROM forge_runs
+        WHERE status LIKE 'running:%'
+          AND current_stage IS NOT NULL
+          AND persona_started_at IS NOT NULL
+          AND persona_started_at < datetime('now', '-15 minutes')`
+    ).all() as Array<{ id: number; current_stage: string; iteration_count: number; persona_started_at: string }>;
+
+    for (const row of stuck) {
+      // Has a record_verdict already landed for this iter+persona? If yes, the
+      // coordinator just hasn't transitioned yet — skip.
+      const existing = db.prepare(
+        'SELECT id FROM forge_verdicts WHERE run_id = ? AND iteration = ? AND persona = ?'
+      ).get(row.id, row.iteration_count, row.current_stage);
+      if (existing) continue;
+
+      // Synthesize a pass:false verdict so handleVerdictRecorded does its thing.
+      bus.publish('forge_t1.verdict.recorded', moduleId, {
+        run_id: row.id,
+        iteration: row.iteration_count,
+        persona: row.current_stage,
+        pass: false,
+        verdict: { notes: 'watchdog_timeout', stage_started_at: row.persona_started_at },
+      });
+    }
+
+    // S5 (N6 from v2 dry-run): secrets-timeout sweep — builds in ready_pending_secrets
+    // for >24h need operator attention. Without this, a forgotten provision step
+    // strands the build (and blocks the dispatcher queue since the run is still
+    // in ACTIVE_STATUSES). 24h is the default; in production the threshold could
+    // come from module.yaml config.
+    const stalledSecrets = db.prepare(
+      `SELECT id, experiment_id, ready_pending_secrets_at
+         FROM forge_runs
+        WHERE status = 'ready_pending_secrets'
+          AND ready_pending_secrets_at IS NOT NULL
+          AND ready_pending_secrets_at < datetime('now', '-24 hours')
+          AND pending_escalation_id IS NULL`
+    ).all() as Array<{ id: number; experiment_id: string; ready_pending_secrets_at: string }>;
+
+    for (const row of stalledSecrets) {
+      bus.publish('forge_t1.build.secrets_timeout', moduleId, {
+        run_id: row.id,
+        experiment_id: row.experiment_id,
+        pending_since: row.ready_pending_secrets_at,
+      });
+      // Re-use the existing build_continue J&J rule — operator can wire secrets and resume,
+      // or cancel the build.
+      const check = escalation.checkAndProceed(
+        moduleId,
+        'build_continue',
+        `Build ${row.id} (${row.experiment_id}) stuck in ready_pending_secrets > 24h`,
+        { run_id: row.id, experiment_id: row.experiment_id, pending_since: row.ready_pending_secrets_at },
+        escalationRules,
+        row.experiment_id,
+        null,
+      );
+      db.prepare('UPDATE forge_runs SET pending_escalation_id = ? WHERE id = ?')
+        .run(check.escalationId ?? null, row.id);
+    }
+  }
+
+  return { start, runWatchdogSweep };
 }
