@@ -1,4 +1,8 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { execSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { createForgeT1Tools } from '../tools.js';
 import type { ModuleToolContext, FeatureCatalogSurface } from '../types.js';
@@ -13,12 +17,20 @@ function makeCtx(): { ctx: ModuleToolContext; db: Database.Database; published: 
       iteration_count INTEGER NOT NULL DEFAULT 0, max_iterations INTEGER NOT NULL DEFAULT 10,
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       solution_repo TEXT, solution_slug TEXT, final_commit_sha TEXT,
-      paused_at TEXT, ready_at TEXT, cancelled_at TEXT, pending_escalation_id INTEGER
+      paused_at TEXT, ready_at TEXT, cancelled_at TEXT, pending_escalation_id INTEGER,
+      last_sandbox_status TEXT, last_sandbox_error TEXT
     );
     CREATE TABLE forge_verdicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id INTEGER NOT NULL, iteration INTEGER NOT NULL, persona TEXT NOT NULL,
       pass INTEGER NOT NULL, verdict_json TEXT NOT NULL, agent_run_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE forge_sandbox_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL, iteration INTEGER NOT NULL,
+      persona TEXT NOT NULL, status TEXT NOT NULL, command TEXT NOT NULL,
+      stdout_tail TEXT, stderr_tail TEXT, duration_ms INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
@@ -97,4 +109,116 @@ describe('forge-t1 tool handlers', () => {
     const parsed = JSON.parse(out as string) as { status: string };
     expect(parsed.status).toBe('deferred_to_coordinator');
   });
+});
+
+// ---------------------------------------------------------------------------
+// commit_to_solution sandbox + Quality carve-out integration tests.
+//
+// These tests bootstrap a workdir at experiments/<expId>/forge-t1-workdir/
+// with a local bare repo as origin so stageCommitPush actually succeeds.
+// The package.json has a failing `npm test` script so the sandbox returns
+// tests_failed deterministically.
+// ---------------------------------------------------------------------------
+
+interface CarveOutEnv extends ReturnType<typeof makeCtx> {
+  runId: number;
+  expId: string;
+  workdirRoot: string;
+  bareRemote: string;
+  cleanupDirs: string[];
+}
+
+function setupCarveOut(): CarveOutEnv {
+  const env = makeCtx() as CarveOutEnv;
+  env.cleanupDirs = [];
+
+  // Unique experiment id per test → independent workdir path inside experiments/.
+  env.expId = `carveout-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Bare repo to act as "origin" — push works locally without network.
+  env.bareRemote = fs.mkdtempSync(path.join(os.tmpdir(), 'bare-remote-'));
+  env.cleanupDirs.push(env.bareRemote);
+  execSync(`git init --bare`, { cwd: env.bareRemote, stdio: 'pipe' });
+
+  // Bootstrap the workdir: init + initial commit + remote pointing at the bare repo.
+  env.workdirRoot = path.resolve(process.cwd(), 'experiments', env.expId, 'forge-t1-workdir');
+  env.cleanupDirs.push(path.dirname(env.workdirRoot));
+  fs.mkdirSync(env.workdirRoot, { recursive: true });
+  execSync(
+    `git init -b main -q && git config user.email t@t && git config user.name t && ` +
+    `echo "# init" > README.md && git add README.md && git commit -q -m init && ` +
+    `git remote add origin ${env.bareRemote} && git push -q -u origin main`,
+    { cwd: env.workdirRoot, stdio: 'pipe', shell: '/bin/bash' },
+  );
+
+  // Sandboxable package.json — tests fail, everything else passes.
+  // No deps so `npm install --no-audit --no-fund --prefer-offline` returns instantly.
+  fs.writeFileSync(path.join(env.workdirRoot, 'package.json'), JSON.stringify({
+    name: 'sb', version: '0.0.0', type: 'module',
+    scripts: {
+      typecheck: 'exit 0',
+      test:      'exit 1',
+      build:     'exit 0',
+    },
+  }));
+  // Commit the package.json so subsequent commits have a baseline.
+  execSync(`git add package.json && git commit -q -m "add package.json" && git push -q origin main`,
+    { cwd: env.workdirRoot, stdio: 'pipe', shell: '/bin/bash' });
+
+  // Seed the forge_runs row pointing at this experiment.
+  const result = env.db.prepare(
+    "INSERT INTO forge_runs (tier, experiment_id, plan_id, status, iteration_count, solution_slug) VALUES ('t1', ?, 7, 'running:builder', 1, 'sb')"
+  ).run(env.expId);
+  env.runId = Number(result.lastInsertRowid);
+
+  return env;
+}
+
+describe('forge-t1 commit_to_solution carve-out', () => {
+  let env: CarveOutEnv;
+  let tools: ReturnType<typeof createForgeT1Tools>;
+  beforeEach(() => {
+    env = setupCarveOut();
+    tools = createForgeT1Tools(env.ctx);
+  });
+  afterEach(() => {
+    for (const d of env.cleanupDirs) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it('quality + all-test files + tests_failed → committed_red_tests (carve-out fires)', async () => {
+    const out = await tools.execute('commit_to_solution', {
+      run_id: env.runId, persona: 'quality', iteration: 1,
+      subject: 'add calculator boundary tests',
+      files: [{ path: 'tests/calculator.test.ts', content: '// failing test body\n' }],
+    });
+    const parsed = JSON.parse(out as string) as { status: string; sha?: string };
+    expect(parsed.status).toBe('committed_red_tests');
+    expect(parsed.sha).toBeTruthy();
+    // last_sandbox_status stays 'failed' so record_verdict's gate still blocks pass:true.
+    const row = env.db.prepare('SELECT last_sandbox_status FROM forge_runs WHERE id = ?').get(env.runId) as { last_sandbox_status: string };
+    expect(row.last_sandbox_status).toBe('failed');
+  }, 30_000);
+
+  it('quality + mixed (test + production) files + tests_failed → sandbox_failed (carve-out blocked)', async () => {
+    const out = await tools.execute('commit_to_solution', {
+      run_id: env.runId, persona: 'quality', iteration: 1,
+      subject: 'add tests + sneak code change',
+      files: [
+        { path: 'tests/calculator.test.ts', content: '// failing test\n' },
+        { path: 'lib/calculator.ts',        content: '// production code change\n' },
+      ],
+    });
+    expect(JSON.parse(out as string).status).toBe('sandbox_failed');
+  }, 30_000);
+
+  it('builder + all-test files + tests_failed → sandbox_failed (carve-out is quality-only)', async () => {
+    const out = await tools.execute('commit_to_solution', {
+      run_id: env.runId, persona: 'builder', iteration: 1,
+      subject: 'add my own tests',
+      files: [{ path: 'tests/foo.test.ts', content: '// failing test\n' }],
+    });
+    expect(JSON.parse(out as string).status).toBe('sandbox_failed');
+  }, 30_000);
 });

@@ -19,8 +19,12 @@
  * publishes forge_t1.build.ready when promotion_review's verdict lands.
  */
 
+import path from 'node:path';
+import fs from 'node:fs';
 import { GitHubClient, type GitHubFile } from './lib/github.js';
 import { VercelClient } from './lib/vercel.js';
+import { Workdir } from './lib/workdir.js';
+import { Sandbox } from './lib/sandbox.js';
 import type {
   FeatureCatalogSurface,
   ModuleToolContext,
@@ -28,6 +32,21 @@ import type {
   PersonaId,
   ToolDefinition,
 } from './types.js';
+
+function workdirPath(experimentId: string): string {
+  return path.resolve(process.cwd(), 'experiments', experimentId, 'forge-t1-workdir');
+}
+
+// Used by the Quality carve-out in handleCommitToSolution: match the
+// project's test-file conventions (Vitest defaults). Conservative — if
+// uncertain, treat as production code.
+function isTestPath(p: string): boolean {
+  const norm = p.replace(/\\/g, '/');
+  if (norm.startsWith('tests/') || norm.includes('/tests/')) return true;
+  if (norm.startsWith('test/') || norm.includes('/test/')) return true;
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(norm)) return true;
+  return false;
+}
 
 const PERSONA_NAMES: PersonaId[] = [
   'builder', 'quality', 'security', 'ci_cd', 'critic', 'tester', 'promotion_review',
@@ -280,25 +299,38 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
       return JSON.stringify({ status: 'github_error', message: errMsg(err) });
     }
 
+    // Clone the new repo into a per-experiment workdir, then push the initial files.
+    const run = ctx.db.prepare('SELECT experiment_id FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string } | undefined;
+    if (!run) return JSON.stringify({ status: 'run_not_found', run_id: runId });
+    const workdirRoot = workdirPath(run.experiment_id);
+    let wd;
+    try {
+      wd = await Workdir.cloneRepo(info.html_url + '.git', workdirRoot, githubToken);
+    } catch (err) {
+      return JSON.stringify({ status: 'clone_error', message: errMsg(err) });
+    }
+
     const initialFiles = Array.isArray(input.initial_files) ? (input.initial_files as GitHubFile[]) : [];
-    let commitSha = '';
+    let commitSha: string | null = null;
     if (initialFiles.length > 0) {
       try {
-        commitSha = await client.pushInitialCommit(info.full_name.split('/')[1], initialFiles, 'chore: initial commit');
+        await wd.writeFiles(initialFiles);
+        commitSha = await wd.stageCommitPush('chore: initial commit');
       } catch (err) {
         return JSON.stringify({ status: 'github_error', message: errMsg(err) });
       }
     }
 
     ctx.db.prepare('UPDATE forge_runs SET solution_repo = ?, solution_slug = ?, final_commit_sha = ? WHERE id = ?')
-      .run(info.full_name, slug, commitSha || null, runId);
+      .run(info.full_name, slug, commitSha, runId);
 
     return JSON.stringify({
       status: 'created',
       full_name: info.full_name,
       html_url: info.html_url,
       default_branch: info.default_branch,
-      initial_commit_sha: commitSha || null,
+      initial_commit_sha: commitSha,
+      workdir: workdirRoot,
     });
   }
 
@@ -357,19 +389,81 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     if (!iteration) return invalid('iteration');
     if (!subject) return invalid('subject');
     if (files.length === 0) return invalid('files');
-    if (!githubToken) return JSON.stringify({ status: 'config_error', message: 'GITHUB_TOKEN not set' });
 
-    const run = ctx.db.prepare('SELECT solution_repo, solution_slug FROM forge_runs WHERE id = ?').get(runId) as { solution_repo: string | null; solution_slug: string | null } | undefined;
+    const run = ctx.db.prepare('SELECT experiment_id, solution_slug FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; solution_slug: string | null } | undefined;
     if (!run || !run.solution_slug) return JSON.stringify({ status: 'run_not_scaffolded', run_id: runId });
 
-    const client = new GitHubClient({ token: githubToken, org: githubOrg });
+    const workdirRoot = workdirPath(run.experiment_id);
+    if (!fs.existsSync(workdirRoot)) return JSON.stringify({ status: 'workdir_missing', message: `Expected workdir at ${workdirRoot}. Did scaffold_solution_repo run?` });
+
+    const wd = new Workdir(workdirRoot);
     try {
-      const sha = await client.commitAndPush(`solution-${run.solution_slug}`, files, { subject, persona, iteration });
-      ctx.db.prepare('UPDATE forge_runs SET final_commit_sha = ? WHERE id = ?').run(sha, runId);
-      return JSON.stringify({ status: 'committed', sha });
+      await wd.writeFiles(files);
     } catch (err) {
-      return JSON.stringify({ status: 'github_error', message: errMsg(err) });
+      return JSON.stringify({ status: 'write_error', message: errMsg(err) });
     }
+
+    // Run sandbox BEFORE committing. If sandbox fails, leave files staged in the
+    // workdir (the agent can iterate on them next turn) but do NOT push — EXCEPT
+    // for the Quality carve-out below.
+    const sandbox = new Sandbox(wd, ctx.db);
+    const sb = await sandbox.run({ runId, iteration, persona });
+    if (sb.status !== 'green') {
+      // Quality carve-out: a failing test that Quality just authored is a
+      // legitimate deliverable (it proves a Builder bug). Push it as
+      // [red-tests] so Builder iter+1 can SEE the test file, not just read
+      // about it in Quality's verdict notes. Conditions:
+      //   - persona is 'quality'
+      //   - sandbox failed at the test step (typecheck/build/install failures don't qualify)
+      //   - every file in the batch is a test file (no production code sneaking through)
+      const allFilesAreTests = files.every(f => isTestPath(f.path));
+      const qualityRedTests =
+        persona === 'quality' &&
+        sb.status === 'tests_failed' &&
+        allFilesAreTests;
+
+      if (qualityRedTests) {
+        let sha: string;
+        try {
+          sha = await wd.stageCommitPush(`[red-tests] quality(${iteration}): ${subject}`);
+        } catch (err) {
+          return JSON.stringify({ status: 'git_error', message: errMsg(err) });
+        }
+        // Keep last_sandbox_status as 'failed' — the gate in record_verdict
+        // still blocks pass=true. Quality MUST record pass=false next.
+        ctx.db.prepare('UPDATE forge_runs SET last_sandbox_status = ?, last_sandbox_error = ? WHERE id = ?')
+          .run('failed', sb.errorSummary, runId);
+        return JSON.stringify({
+          status: 'committed_red_tests',
+          sha,
+          sandbox_status: sb.status,
+          error_summary: sb.errorSummary,
+          message: 'Failing tests pushed as [red-tests]. Now call record_verdict with pass:false and detail the failure in verdict.notes — Builder will pick it up next iteration.',
+        });
+      }
+
+      ctx.db.prepare('UPDATE forge_runs SET last_sandbox_status = ?, last_sandbox_error = ? WHERE id = ?')
+        .run('failed', sb.errorSummary, runId);
+      return JSON.stringify({
+        status: 'sandbox_failed',
+        sandbox_status: sb.status,
+        error_summary: sb.errorSummary,
+        stdout_tail: sb.stdoutTail.slice(-1500),
+        stderr_tail: sb.stderrTail.slice(-1500),
+        message: 'Files written to workdir but NOT pushed. Fix the errors and call commit_to_solution again. Do not call record_verdict with pass:true until sandbox returns green.',
+      });
+    }
+
+    // Sandbox green → commit + push.
+    let sha: string;
+    try {
+      sha = await wd.stageCommitPush(`${persona}(${iteration}): ${subject}`);
+    } catch (err) {
+      return JSON.stringify({ status: 'git_error', message: errMsg(err) });
+    }
+    ctx.db.prepare('UPDATE forge_runs SET final_commit_sha = ?, last_sandbox_status = ?, last_sandbox_error = NULL WHERE id = ?')
+      .run(sha, 'green', runId);
+    return JSON.stringify({ status: 'committed', sha, sandbox_status: 'green' });
   }
 
   function handleProposeFeaturePromotion(input: Record<string, unknown>): string {
