@@ -161,9 +161,9 @@ export function createForgeT1Tools(_ctx: ModuleToolContext): ModuleTools {
     },
   ];
 
-  async function execute(toolName: string, _input: unknown): Promise<{ status: 'not_implemented'; tool: string }> {
+  async function execute(toolName: string, _input: Record<string, unknown>): Promise<string> {
     // Phase 6 replaces this with real handlers.
-    return { status: 'not_implemented', tool: toolName };
+    return JSON.stringify({ status: 'not_implemented', tool: toolName });
   }
 
   return { definitions, execute };
