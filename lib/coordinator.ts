@@ -41,6 +41,9 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     const planId = numOr0(p.plan_id);
     const experimentId = typeof p.experiment_id === 'string' ? p.experiment_id : '';
     const tier = typeof p.tier === 'string' ? p.tier : 't1';
+    // Phase 11: local-mode builds use a local workdir (~/personalprojects/forge-local-builds/<slug>/)
+    // and skip the create_github_repo J&J. Anthropic API still gets called.
+    const isLocal = p.local === true;
     if (!planId || !experimentId) return;
 
     const existing = db.prepare(
@@ -49,9 +52,9 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     if (existing) return;
 
     const result = db.prepare(
-      `INSERT INTO forge_runs (tier, experiment_id, plan_id, status, current_stage, iteration_count, max_iterations)
-       VALUES (?, ?, ?, 'pending', NULL, 1, 10)`
-    ).run(tier, experimentId, planId);
+      `INSERT INTO forge_runs (tier, experiment_id, plan_id, status, current_stage, iteration_count, max_iterations, local)
+       VALUES (?, ?, ?, 'pending', NULL, 1, 10, ?)`
+    ).run(tier, experimentId, planId, isLocal ? 1 : 0);
     const runId = Number(result.lastInsertRowid);
 
     // R9 (2026-05-25 dry-run): the brief now carries two separate budget fields.
@@ -68,7 +71,15 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     const costCap  = explicit ?? legacy ?? 20; // default $20/build
     db.prepare('UPDATE forge_runs SET cost_usd_cap = ? WHERE id = ?').run(costCap, runId);
 
-    bus.publish('forge_t1.build.started', moduleId, { run_id: runId, experiment_id: experimentId, plan_id: planId });
+    bus.publish('forge_t1.build.started', moduleId, { run_id: runId, experiment_id: experimentId, plan_id: planId, local: isLocal });
+
+    // Local mode skips the create_github_repo J&J — there's no GitHub repo
+    // being created, so there's nothing for a human to approve. The actual
+    // local workdir lives at ~/personalprojects/forge-local-builds/<slug>/.
+    if (isLocal) {
+      enterBuilderIteration(runId, 1);
+      return;
+    }
 
     const slug = deriveSlug(experimentId, p);
     const check = escalation.checkAndProceed(

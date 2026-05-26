@@ -37,6 +37,17 @@ function workdirPath(experimentId: string): string {
   return path.resolve(process.cwd(), 'experiments', experimentId, 'forge-t1-workdir');
 }
 
+/**
+ * Phase 11: where a local-mode build lives. Persistent + readable by humans —
+ * after the build finishes the operator can `cd` in and `npm install && npm run dev`.
+ * Override via FORGE_LOCAL_BUILDS_DIR if needed.
+ */
+function localWorkdirPath(slug: string): string {
+  const base = process.env.FORGE_LOCAL_BUILDS_DIR
+    ?? path.join(process.env.HOME ?? '/tmp', 'personalprojects', 'forge-local-builds');
+  return path.join(base, slug);
+}
+
 // Used by the Quality carve-out in handleCommitToSolution: match the
 // project's test-file conventions (Vitest defaults). Conservative — if
 // uncertain, treat as production code.
@@ -294,6 +305,44 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     if (!runId) return invalid('run_id');
     if (!SLUG_RE.test(slug)) return invalid('slug');
     if (!description) return invalid('description');
+
+    const run = ctx.db.prepare('SELECT experiment_id, local FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; local: number } | undefined;
+    if (!run) return JSON.stringify({ status: 'run_not_found', run_id: runId });
+
+    const initialFiles = Array.isArray(input.initial_files) ? (input.initial_files as GitHubFile[]) : [];
+
+    // Phase 11 — local-mode branch: skip GitHub, init a local repo at
+    // ~/personalprojects/forge-local-builds/<slug>/. No GITHUB_TOKEN needed.
+    if (run.local === 1) {
+      const workdirRoot = localWorkdirPath(slug);
+      let wd;
+      try {
+        wd = await Workdir.initLocal(workdirRoot);
+      } catch (err) {
+        return JSON.stringify({ status: 'workdir_error', message: errMsg(err) });
+      }
+      let commitSha: string | null = null;
+      if (initialFiles.length > 0) {
+        try {
+          await wd.writeFiles(initialFiles);
+          commitSha = await wd.stageCommitLocal('chore: initial commit');
+        } catch (err) {
+          return JSON.stringify({ status: 'workdir_error', message: errMsg(err) });
+        }
+      }
+      const fullName = `local/${slug}`;
+      ctx.db.prepare('UPDATE forge_runs SET solution_repo = ?, solution_slug = ?, final_commit_sha = ? WHERE id = ?')
+        .run(fullName, slug, commitSha, runId);
+      return JSON.stringify({
+        status: 'created_local',
+        full_name: fullName,
+        workdir: workdirRoot,
+        default_branch: 'main',
+        initial_commit_sha: commitSha,
+        message: `Local-mode build. Inspect with: cd ${workdirRoot} && npm install && npm run dev`,
+      });
+    }
+
     if (!githubToken) return JSON.stringify({ status: 'config_error', message: 'GITHUB_TOKEN not set' });
 
     const client = new GitHubClient({ token: githubToken, org: githubOrg });
@@ -305,8 +354,6 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     }
 
     // Clone the new repo into a per-experiment workdir, then push the initial files.
-    const run = ctx.db.prepare('SELECT experiment_id FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string } | undefined;
-    if (!run) return JSON.stringify({ status: 'run_not_found', run_id: runId });
     const workdirRoot = workdirPath(run.experiment_id);
     let wd;
     try {
@@ -315,7 +362,6 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
       return JSON.stringify({ status: 'clone_error', message: errMsg(err) });
     }
 
-    const initialFiles = Array.isArray(input.initial_files) ? (input.initial_files as GitHubFile[]) : [];
     let commitSha: string | null = null;
     if (initialFiles.length > 0) {
       try {
@@ -395,10 +441,11 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     if (!subject) return invalid('subject');
     if (files.length === 0) return invalid('files');
 
-    const run = ctx.db.prepare('SELECT experiment_id, solution_slug FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; solution_slug: string | null } | undefined;
+    const run = ctx.db.prepare('SELECT experiment_id, solution_slug, local FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; solution_slug: string | null; local: number } | undefined;
     if (!run || !run.solution_slug) return JSON.stringify({ status: 'run_not_scaffolded', run_id: runId });
 
-    const workdirRoot = workdirPath(run.experiment_id);
+    const isLocal = run.local === 1;
+    const workdirRoot = isLocal ? localWorkdirPath(run.solution_slug) : workdirPath(run.experiment_id);
     if (!fs.existsSync(workdirRoot)) return JSON.stringify({ status: 'workdir_missing', message: `Expected workdir at ${workdirRoot}. Did scaffold_solution_repo run?` });
 
     const wd = new Workdir(workdirRoot);
@@ -430,7 +477,8 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
       if (qualityRedTests) {
         let sha: string;
         try {
-          sha = await wd.stageCommitPush(`[red-tests] quality(${iteration}): ${subject}`);
+          const msg = `[red-tests] quality(${iteration}): ${subject}`;
+          sha = isLocal ? await wd.stageCommitLocal(msg) : await wd.stageCommitPush(msg);
         } catch (err) {
           return JSON.stringify({ status: 'git_error', message: errMsg(err) });
         }
@@ -459,10 +507,11 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
       });
     }
 
-    // Sandbox green → commit + push.
+    // Sandbox green → commit (push in remote mode, local-only in local mode).
     let sha: string;
     try {
-      sha = await wd.stageCommitPush(`${persona}(${iteration}): ${subject}`);
+      const msg = `${persona}(${iteration}): ${subject}`;
+      sha = isLocal ? await wd.stageCommitLocal(msg) : await wd.stageCommitPush(msg);
     } catch (err) {
       return JSON.stringify({ status: 'git_error', message: errMsg(err) });
     }
@@ -485,11 +534,32 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
   }
 
   async function handleProvisionVercelEnv(input: Record<string, unknown>): Promise<string> {
+    const runId = numOr0(input.run_id);
+    const vars = (input.env_vars && typeof input.env_vars === 'object') ? (input.env_vars as Record<string, string>) : null;
+    if (!vars) return invalid('env_vars');
+
+    // Phase 11 — local-mode branch: write .env.local + .env.example into the
+    // local workdir. No Vercel API call; the build does not deploy.
+    if (runId) {
+      const run = ctx.db.prepare('SELECT solution_slug, local FROM forge_runs WHERE id = ?').get(runId) as { solution_slug: string | null; local: number } | undefined;
+      if (run?.local === 1 && run.solution_slug) {
+        const wdRoot = localWorkdirPath(run.solution_slug);
+        if (!fs.existsSync(wdRoot)) return JSON.stringify({ status: 'workdir_missing', run_id: runId });
+        const exampleLines = Object.keys(vars).map(k => `${k}=`).join('\n') + '\n';
+        const localLines = Object.entries(vars).map(([k, v]) => `${k}=${v || `# TODO: fill in ${k}`}`).join('\n') + '\n';
+        fs.writeFileSync(path.join(wdRoot, '.env.example'), exampleLines);
+        fs.writeFileSync(path.join(wdRoot, '.env.local'), localLines);
+        return JSON.stringify({
+          status: 'env_set_local',
+          keys: Object.keys(vars),
+          message: `Wrote .env.example + .env.local to ${wdRoot}. Fill in placeholder values before running 'npm run dev'.`,
+        });
+      }
+    }
+
     if (!vercelToken || !vercelOrgId) return JSON.stringify({ status: 'config_error', message: 'VERCEL_API_TOKEN / VERCEL_ORG_ID not set' });
     const projectId = strOr(input.vercel_project_id, '');
     if (!projectId) return invalid('vercel_project_id');
-    const vars = (input.env_vars && typeof input.env_vars === 'object') ? (input.env_vars as Record<string, string>) : null;
-    if (!vars) return invalid('env_vars');
     const client = new VercelClient({ token: vercelToken, orgId: vercelOrgId });
     try {
       await client.setEnvVars(projectId, vars);
@@ -500,6 +570,16 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
   }
 
   async function handleAttachCustomDomain(input: Record<string, unknown>): Promise<string> {
+    const runId = numOr0(input.run_id);
+    if (runId) {
+      const run = ctx.db.prepare('SELECT local FROM forge_runs WHERE id = ?').get(runId) as { local: number } | undefined;
+      if (run?.local === 1) {
+        return JSON.stringify({
+          status: 'skipped_local',
+          message: 'attach_custom_domain is a no-op in local mode (no Vercel project to attach to).',
+        });
+      }
+    }
     if (!vercelToken || !vercelOrgId) return JSON.stringify({ status: 'config_error', message: 'VERCEL_API_TOKEN / VERCEL_ORG_ID not set' });
     const projectId = strOr(input.vercel_project_id, '');
     const domain = strOr(input.domain, '');
