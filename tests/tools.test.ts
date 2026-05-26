@@ -18,7 +18,8 @@ function makeCtx(): { ctx: ModuleToolContext; db: Database.Database; published: 
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       solution_repo TEXT, solution_slug TEXT, final_commit_sha TEXT,
       paused_at TEXT, ready_at TEXT, cancelled_at TEXT, pending_escalation_id INTEGER,
-      last_sandbox_status TEXT, last_sandbox_error TEXT
+      last_sandbox_status TEXT, last_sandbox_error TEXT,
+      local INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE forge_verdicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

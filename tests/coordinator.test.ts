@@ -45,7 +45,8 @@ function makeContext(): {
       cost_usd_cap REAL,
       persona_started_at TEXT,
       last_sandbox_status TEXT,
-      last_sandbox_error TEXT
+      last_sandbox_error TEXT,
+      local INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE forge_verdicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

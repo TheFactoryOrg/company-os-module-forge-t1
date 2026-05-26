@@ -44,6 +44,21 @@ export class Workdir {
     return wd;
   }
 
+  /**
+   * Local-mode workdir (Phase 11): initialize a fresh git repo at `root`
+   * with no remote. Used when forge_runs.local=1 so the build proceeds
+   * without ever calling GitHub. The sandbox + commits run unchanged;
+   * `stageCommitLocal` replaces `stageCommitPush` (no push).
+   */
+  static async initLocal(root: string): Promise<Workdir> {
+    const wd = new Workdir(root);
+    if (!fs.existsSync(path.join(root, '.git'))) {
+      const init = await wd.runShell('git init -q -b main', { timeoutMs: 30_000 });
+      if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr.slice(-500)}`);
+    }
+    return wd;
+  }
+
   get path(): string { return this.root; }
 
   async writeFiles(files: WorkdirFile[]): Promise<void> {
@@ -103,6 +118,21 @@ export class Workdir {
     }
     const push = await this.runShell('git push origin HEAD', { timeoutMs: 60_000 });
     if (push.exitCode !== 0) throw new Error(`git push failed: ${push.stderr}`);
+    const sha = await this.runShell('git rev-parse HEAD', { timeoutMs: 10_000 });
+    return sha.stdout.trim();
+  }
+
+  /**
+   * Same as stageCommitPush but skips the `git push` — for local-mode builds.
+   * Returns the new HEAD sha so callers can record final_commit_sha unchanged.
+   */
+  async stageCommitLocal(message: string): Promise<string> {
+    const add = await this.runShell('git add -A', { timeoutMs: 30_000 });
+    if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
+    const commit = await this.runShell(`git -c user.email=forge-t1@thefactoryorg.dev -c user.name="Forge T1" commit -m ${shellQuote(message)}`, { timeoutMs: 30_000 });
+    if (commit.exitCode !== 0 && !commit.stdout.includes('nothing to commit')) {
+      throw new Error(`git commit failed: ${commit.stderr}`);
+    }
     const sha = await this.runShell('git rev-parse HEAD', { timeoutMs: 10_000 });
     return sha.stdout.trim();
   }
