@@ -52,6 +52,11 @@ const PERSONA_NAMES: PersonaId[] = [
   'builder', 'quality', 'security', 'ci_cd', 'critic', 'tester', 'promotion_review',
 ];
 
+// Personas that write code: their pass:true claims must be backed by a
+// green sandbox run for the current iteration. Critic + Security only
+// emit verdicts; promotion_review reads only.
+const COMMITTING_PERSONAS = new Set<PersonaId>(['builder', 'quality', 'ci_cd', 'tester']);
+
 const SLUG_RE = /^[a-z][a-z0-9-]{1,31}$/;
 
 export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
@@ -525,6 +530,20 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     if (!PERSONA_NAMES.includes(persona as PersonaId)) return invalid('persona');
     if (typeof input.pass !== 'boolean') return invalid('pass');
     if (!verdict) return invalid('verdict');
+
+    // Gate: committing personas claiming pass=true must have a green sandbox
+    // run for THIS iteration. Reading forge_sandbox_runs is cheap (indexed).
+    if (input.pass === true && COMMITTING_PERSONAS.has(persona as PersonaId)) {
+      const lastSandbox = ctx.db.prepare(
+        "SELECT status FROM forge_sandbox_runs WHERE run_id = ? AND iteration = ? AND persona = ? ORDER BY id DESC LIMIT 1"
+      ).get(runId, iteration, persona) as { status: string } | undefined;
+      if (!lastSandbox || lastSandbox.status !== 'green') {
+        return JSON.stringify({
+          status: 'sandbox_required',
+          message: `Persona "${persona}" cannot record pass=true without a green sandbox run for iteration ${iteration}. Call commit_to_solution with the working files first; once it returns sandbox_status: 'green', you may record_verdict with pass=true.`,
+        });
+      }
+    }
 
     const result = ctx.db.prepare(
       'INSERT INTO forge_verdicts (run_id, iteration, persona, pass, verdict_json) VALUES (?, ?, ?, ?, ?)'

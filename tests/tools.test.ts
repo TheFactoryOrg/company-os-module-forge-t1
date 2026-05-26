@@ -76,6 +76,12 @@ describe('forge-t1 tool handlers', () => {
 
   it('record_verdict writes a forge_verdicts row and publishes forge_t1.verdict.recorded', async () => {
     const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    // Builder is a committing persona; the sandbox gate (Task 6.5.5) requires
+    // a green forge_sandbox_runs row for the iteration before pass:true is
+    // accepted. Seed one for this test.
+    env.db.prepare(
+      "INSERT INTO forge_sandbox_runs (run_id, iteration, persona, status, command, duration_ms) VALUES (?, 1, 'builder', 'green', 'all', 100)"
+    ).run(runId);
     const out = await tools.execute('record_verdict', {
       run_id: runId, iteration: 1, persona: 'builder', pass: true,
       verdict: { notes: 'looks good', files_changed: ['app/page.tsx'] },
@@ -86,6 +92,39 @@ describe('forge-t1 tool handlers', () => {
     expect(row.persona).toBe('builder');
     expect(row.pass).toBe(1);
     expect(env.published.find(e => e.type === 'forge_t1.verdict.recorded')).toBeTruthy();
+  });
+
+  it('record_verdict refuses pass=true for builder when sandbox has not run green', async () => {
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    // No forge_sandbox_runs row for builder iter=1 → gate triggers.
+    const out = await tools.execute('record_verdict', {
+      run_id: runId, iteration: 1, persona: 'builder', pass: true,
+      verdict: { notes: 'looks good' },
+    });
+    expect(JSON.parse(out as string).status).toBe('sandbox_required');
+  });
+
+  it('record_verdict allows pass=false for committing personas without sandbox green (Quality red-tests path)', async () => {
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    // Sandbox is red — only Quality's [red-tests] carve-out commits without green.
+    // Quality must then record pass:false (no gate fires).
+    env.db.prepare(
+      "INSERT INTO forge_sandbox_runs (run_id, iteration, persona, status, command, duration_ms) VALUES (?, 1, 'quality', 'tests_failed', 'all', 100)"
+    ).run(runId);
+    const out = await tools.execute('record_verdict', {
+      run_id: runId, iteration: 1, persona: 'quality', pass: false,
+      verdict: { notes: 'pushed [red-tests] — Builder should fix lib/foo.ts' },
+    });
+    expect(JSON.parse(out as string).status).toBe('recorded');
+  });
+
+  it('record_verdict allows pass=true for critic without sandbox (read-only persona)', async () => {
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    const out = await tools.execute('record_verdict', {
+      run_id: runId, iteration: 1, persona: 'critic', pass: true,
+      verdict: { notes: 'PRD alignment 92', alignment_score: 92 },
+    });
+    expect(JSON.parse(out as string).status).toBe('recorded');
   });
 
   it('record_verdict rejects unknown persona', async () => {
