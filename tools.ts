@@ -1,36 +1,68 @@
 /**
  * Forge T1 — tool factory.
  *
- * Tools are split into:
- *  - boundary actions (J&J): scaffold_solution_repo (and downstream
- *    build_continue/build_cancel handled by the coordinator escalation flow).
- *  - internal loop tools (inform): scaffold/quality/security/ci_cd/critic/tester/etc.
+ * Personas own subsets of these tools (see agent.md for persona-tool mapping):
+ *   Builder:  scaffold_solution_repo, query_feature_catalog, pull_feature,
+ *             commit_to_solution, propose_feature_promotion, record_verdict
+ *   Quality:  run_quality_checks, commit_to_solution, record_verdict
+ *   Security: run_security_scan, record_verdict
+ *   CI/CD:    configure_ci_cd, provision_vercel_env, attach_custom_domain,
+ *             commit_to_solution, record_verdict
+ *   Critic:   run_critic_evaluation, record_verdict
+ *   Tester:   run_e2e_test, commit_to_solution, record_verdict
  *
- * The coordinator in lib/coordinator.ts orchestrates the iterate-to-fixed-point
- * loop using these tools. Phase 6 implements the coordinator + persona prompts
- * and replaces these stub handlers.
+ * Boundary actions (create_github_repo, build_continue, build_cancel) are
+ * handled by the coordinator, not by the agent — see lib/coordinator.ts.
+ *
+ * `publish_build_ready` exists on the tool surface for symmetry with the
+ * spec table but is a no-op when invoked from the agent: the coordinator
+ * publishes forge_t1.build.ready when promotion_review's verdict lands.
  */
 
-import type { ModuleToolContext, ModuleTools, ToolDefinition } from './types.js';
+import { GitHubClient, type GitHubFile } from './lib/github.js';
+import { VercelClient } from './lib/vercel.js';
+import type {
+  FeatureCatalogSurface,
+  ModuleToolContext,
+  ModuleTools,
+  PersonaId,
+  ToolDefinition,
+} from './types.js';
 
-export function createForgeT1Tools(_ctx: ModuleToolContext): ModuleTools {
+const PERSONA_NAMES: PersonaId[] = [
+  'builder', 'quality', 'security', 'ci_cd', 'critic', 'tester', 'promotion_review',
+];
+
+const SLUG_RE = /^[a-z][a-z0-9-]{1,31}$/;
+
+export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
   const definitions: ToolDefinition[] = [
     {
       name: 'scaffold_solution_repo',
-      description: 'Create TheFactoryOrg/solution-<slug> GitHub repo and push initial commit. J&J-gated.',
+      description: 'Create TheFactoryOrg/solution-<slug> on GitHub and push the initial commit. Coordinator already gated this with create_github_repo (J&J); this tool performs the API call.',
       input_schema: {
         type: 'object',
         properties: {
+          run_id: { type: 'number' },
           slug: { type: 'string', description: 'Solution slug ^[a-z][a-z0-9-]{1,31}$' },
-          description: { type: 'string', description: 'Repo description' },
+          description: { type: 'string' },
+          initial_files: {
+            type: 'array',
+            description: 'Files to commit on initial push. Empty → just creates the auto-init repo.',
+            items: {
+              type: 'object',
+              properties: { path: { type: 'string' }, content: { type: 'string' } },
+              required: ['path', 'content'],
+            },
+          },
           private: { type: 'boolean', default: false },
         },
-        required: ['slug', 'description'],
+        required: ['run_id', 'slug', 'description'],
       },
     },
     {
       name: 'query_feature_catalog',
-      description: 'Search the Catalog for features matching filter.',
+      description: 'Search the Catalog for features matching filter (kind, tier, tracks, category, tag, search). Returns array of matches.',
       input_schema: {
         type: 'object',
         properties: {
@@ -45,126 +77,380 @@ export function createForgeT1Tools(_ctx: ModuleToolContext): ModuleTools {
     },
     {
       name: 'pull_feature',
-      description: 'Materialize a feature into the working solution (kind-aware).',
+      description: 'Materialize a Catalog feature into the working solution directory. Kind-aware: snippet=copy+sub, integration=add SDK+glue, platform=copy client. Returns files_added/deps/env_vars.',
       input_schema: {
         type: 'object',
         properties: {
+          run_id: { type: 'number' },
           feature_id: { type: 'string' },
-          intent: { type: 'string' },
+          intent: { type: 'string', description: 'use as-is | use as base scaffold | customize | extend' },
+          solution_path: { type: 'string' },
           substitutions: { type: 'object' },
         },
-        required: ['feature_id', 'intent'],
+        required: ['run_id', 'feature_id', 'intent', 'solution_path'],
       },
     },
     {
       name: 'commit_to_solution',
-      description: 'git commit + push the current working state with a structured message.',
+      description: 'Commit + push files to the solution repo. Subject is prefixed as <persona>(<iter>): <subject> per spec §8.',
       input_schema: {
         type: 'object',
         properties: {
-          message: { type: 'string' },
-          persona: { type: 'string' },
-          iteration: { type: 'integer' },
+          run_id: { type: 'number' },
+          persona: { type: 'string', enum: PERSONA_NAMES },
+          iteration: { type: 'number' },
+          subject: { type: 'string' },
+          files: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { path: { type: 'string' }, content: { type: 'string' } },
+              required: ['path', 'content'],
+            },
+            minItems: 1,
+          },
         },
-        required: ['message', 'persona', 'iteration'],
+        required: ['run_id', 'persona', 'iteration', 'subject', 'files'],
       },
     },
     {
       name: 'propose_feature_promotion',
-      description: 'Propose a chunk of solution code for promotion to the Catalog. Pending operator approval.',
+      description: 'Mark a piece of solution code as catalog-worthy. Queues a feature_promotions row for operator approval.',
       input_schema: {
         type: 'object',
         properties: {
-          proposed_id: { type: 'string' },
-          proposed_spec: { type: 'object' },
-          payload_path: { type: 'string' },
-          rationale: { type: 'string' },
+          run_id: { type: 'number' },
+          spec: { type: 'object', description: 'Proposed feature.yaml spec' },
+          payload_path: { type: 'string', description: 'Local path containing candidate code to copy on approval' },
         },
-        required: ['proposed_id', 'proposed_spec', 'payload_path'],
+        required: ['run_id', 'spec', 'payload_path'],
       },
     },
     {
       name: 'run_quality_checks',
-      description: 'Run npm run lint && tsc && npm test in the solution repo. Return pass/fail + failures.',
-      input_schema: { type: 'object', properties: {} },
+      description: 'Persona-Quality tool. Agent reports tests added and any failures.',
+      input_schema: {
+        type: 'object',
+        properties: { run_id: { type: 'number' }, tests_added: { type: 'array', items: { type: 'string' } } },
+        required: ['run_id'],
+      },
     },
     {
       name: 'run_security_scan',
-      description: 'npm audit + secret sweep + no-DB-enforcement.',
-      input_schema: { type: 'object', properties: {} },
+      description: 'Persona-Security tool. Agent records advisories and the no-DB-rule check.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          run_id: { type: 'number' },
+          advisories: { type: 'array', items: { type: 'object' } },
+          db_violation_found: { type: 'boolean' },
+        },
+        required: ['run_id'],
+      },
     },
     {
       name: 'configure_ci_cd',
-      description: 'Write .github/workflows/, vercel.json, observability config.',
-      input_schema: { type: 'object', properties: {} },
+      description: 'CI/CD persona records the workflow YAMLs and vercel.json added. Files committed via commit_to_solution.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          run_id: { type: 'number' },
+          workflows_added: { type: 'array', items: { type: 'string' } },
+          vercel_configured: { type: 'boolean' },
+          observability_configured: { type: 'boolean' },
+        },
+        required: ['run_id'],
+      },
     },
     {
       name: 'provision_vercel_env',
-      description: 'Set Vercel project env vars from solution .env.example.',
+      description: 'Set Vercel env vars on the solution project.',
       input_schema: {
         type: 'object',
-        properties: { env_vars: { type: 'object' } },
+        properties: {
+          run_id: { type: 'number' },
+          vercel_project_id: { type: 'string' },
+          env_vars: { type: 'object', description: 'Map of key → value' },
+        },
+        required: ['run_id', 'vercel_project_id', 'env_vars'],
       },
     },
     {
       name: 'attach_custom_domain',
-      description: 'Call Vercel API to attach a custom domain if desired_domain in brief.',
+      description: 'Attach a custom domain to the solution\'s Vercel project, if the brief specifies one.',
       input_schema: {
         type: 'object',
-        properties: { desired_domain: { type: 'string' } },
-        required: ['desired_domain'],
+        properties: {
+          run_id: { type: 'number' },
+          vercel_project_id: { type: 'string' },
+          domain: { type: 'string' },
+        },
+        required: ['run_id', 'vercel_project_id', 'domain'],
       },
     },
     {
       name: 'run_critic_evaluation',
-      description: 'Critic persona: read PRD + solution, return alignment_score 0-100 + misalignments[].',
-      input_schema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'run_e2e_test',
-      description: 'Tester persona: build solution, run smoke script against preview deploy.',
-      input_schema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'record_verdict',
-      description: 'Persist a persona verdict to forge_verdicts. Advances or restarts the loop.',
+      description: 'Critic persona records alignment score (0–100) and misalignments against PRD.',
       input_schema: {
         type: 'object',
         properties: {
-          run_id: { type: 'integer' },
-          iteration: { type: 'integer' },
-          persona: { type: 'string' },
+          run_id: { type: 'number' },
+          alignment_score: { type: 'number' },
+          misalignments: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['run_id', 'alignment_score'],
+      },
+    },
+    {
+      name: 'run_e2e_test',
+      description: 'Tester persona records E2E results + evidence URLs.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          run_id: { type: 'number' },
+          e2e_results: { type: 'array', items: { type: 'object' } },
+          evidence: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['run_id'],
+      },
+    },
+    {
+      name: 'record_verdict',
+      description: 'Persist a persona verdict to forge_verdicts and publish forge_t1.verdict.recorded. THIS MUST BE THE FINAL TOOL CALL of every persona run.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          run_id: { type: 'number' },
+          iteration: { type: 'number' },
+          persona: { type: 'string', enum: PERSONA_NAMES },
           pass: { type: 'boolean' },
-          verdict: { type: 'object' },
-          agent_run_id: { type: 'integer' },
+          verdict: { type: 'object', description: 'Full persona-shaped verdict payload (see spec §3 table)' },
         },
         required: ['run_id', 'iteration', 'persona', 'pass', 'verdict'],
       },
     },
     {
-      name: 'request_continue_or_cancel',
-      description: 'At iteration cap, escalate to J&J with full verdict bundle.',
-      input_schema: {
-        type: 'object',
-        properties: { run_id: { type: 'integer' } },
-        required: ['run_id'],
-      },
-    },
-    {
       name: 'publish_build_ready',
-      description: 'Emit forge_t1.build.ready with the verdict bundle + promotions.',
-      input_schema: {
-        type: 'object',
-        properties: { run_id: { type: 'integer' } },
-        required: ['run_id'],
-      },
+      description: 'No-op from the agent — the coordinator publishes forge_t1.build.ready when promotion_review records a passing verdict. Present here only for spec symmetry.',
+      input_schema: { type: 'object', properties: { run_id: { type: 'number' } }, required: ['run_id'] },
     },
   ];
 
-  async function execute(toolName: string, _input: Record<string, unknown>): Promise<string> {
-    // Phase 6 replaces this with real handlers.
-    return JSON.stringify({ status: 'not_implemented', tool: toolName });
+  // --- Handlers ----------------------------------------------------------
+
+  const githubToken = process.env.GITHUB_TOKEN ?? '';
+  const githubOrg = process.env.GITHUB_ORG ?? 'TheFactoryOrg';
+  const vercelToken = process.env.VERCEL_API_TOKEN ?? '';
+  const vercelOrgId = process.env.VERCEL_ORG_ID ?? '';
+
+  async function execute(toolName: string, input: Record<string, unknown>): Promise<string> {
+    switch (toolName) {
+      case 'scaffold_solution_repo':       return await handleScaffoldSolutionRepo(input);
+      case 'query_feature_catalog':        return handleQueryFeatureCatalog(input);
+      case 'pull_feature':                 return await handlePullFeature(input);
+      case 'commit_to_solution':           return await handleCommitToSolution(input);
+      case 'propose_feature_promotion':    return handleProposeFeaturePromotion(input);
+      case 'run_quality_checks':           return handleSnapshot(input, 'quality');
+      case 'run_security_scan':            return handleSnapshot(input, 'security');
+      case 'configure_ci_cd':              return handleSnapshot(input, 'ci_cd');
+      case 'provision_vercel_env':         return await handleProvisionVercelEnv(input);
+      case 'attach_custom_domain':         return await handleAttachCustomDomain(input);
+      case 'run_critic_evaluation':        return handleSnapshot(input, 'critic');
+      case 'run_e2e_test':                 return handleSnapshot(input, 'tester');
+      case 'record_verdict':               return handleRecordVerdict(input);
+      case 'publish_build_ready':          return JSON.stringify({ status: 'deferred_to_coordinator' });
+      default:                             return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+    }
+  }
+
+  async function handleScaffoldSolutionRepo(input: Record<string, unknown>): Promise<string> {
+    const runId = numOr0(input.run_id);
+    const slug = strOr(input.slug, '');
+    const description = strOr(input.description, '');
+    if (!runId) return invalid('run_id');
+    if (!SLUG_RE.test(slug)) return invalid('slug');
+    if (!description) return invalid('description');
+    if (!githubToken) return JSON.stringify({ status: 'config_error', message: 'GITHUB_TOKEN not set' });
+
+    const client = new GitHubClient({ token: githubToken, org: githubOrg });
+    let info;
+    try {
+      info = await client.createSolutionRepo(slug, description, input.private === true);
+    } catch (err) {
+      return JSON.stringify({ status: 'github_error', message: errMsg(err) });
+    }
+
+    const initialFiles = Array.isArray(input.initial_files) ? (input.initial_files as GitHubFile[]) : [];
+    let commitSha = '';
+    if (initialFiles.length > 0) {
+      try {
+        commitSha = await client.pushInitialCommit(info.full_name.split('/')[1], initialFiles, 'chore: initial commit');
+      } catch (err) {
+        return JSON.stringify({ status: 'github_error', message: errMsg(err) });
+      }
+    }
+
+    ctx.db.prepare('UPDATE forge_runs SET solution_repo = ?, solution_slug = ?, final_commit_sha = ? WHERE id = ?')
+      .run(info.full_name, slug, commitSha || null, runId);
+
+    return JSON.stringify({
+      status: 'created',
+      full_name: info.full_name,
+      html_url: info.html_url,
+      default_branch: info.default_branch,
+      initial_commit_sha: commitSha || null,
+    });
+  }
+
+  function handleQueryFeatureCatalog(input: Record<string, unknown>): string {
+    if (!ctx.featureCatalog) return JSON.stringify({ status: 'config_error', message: 'FeatureCatalog not wired into ctx' });
+    const filter: Parameters<FeatureCatalogSurface['list']>[0] = {
+      kind: strOptional(input.kind),
+      tier: strOptional(input.tier),
+      tracks: Array.isArray(input.tracks) ? (input.tracks as string[]) : undefined,
+      category: strOptional(input.category),
+      tag: strOptional(input.tag),
+      search: strOptional(input.search),
+      status: 'active',
+    };
+    const features = ctx.featureCatalog.list(filter);
+    return JSON.stringify({ status: 'ok', features });
+  }
+
+  async function handlePullFeature(input: Record<string, unknown>): Promise<string> {
+    if (!ctx.featureCatalog) return JSON.stringify({ status: 'config_error', message: 'FeatureCatalog not wired' });
+    const runId = numOr0(input.run_id);
+    const featureId = strOr(input.feature_id, '');
+    const intent = strOr(input.intent, '');
+    const solutionPath = strOr(input.solution_path, '');
+    if (!runId) return invalid('run_id');
+    if (!featureId) return invalid('feature_id');
+    if (!intent) return invalid('intent');
+    if (!solutionPath) return invalid('solution_path');
+
+    const run = ctx.db.prepare('SELECT experiment_id, solution_repo, tier FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; solution_repo: string | null; tier: string } | undefined;
+    if (!run) return JSON.stringify({ status: 'run_not_found', run_id: runId });
+
+    const subs = (input.substitutions && typeof input.substitutions === 'object')
+      ? (input.substitutions as Record<string, string>)
+      : {};
+
+    try {
+      const result = await ctx.featureCatalog.materialize(
+        featureId, intent, solutionPath, subs,
+        { experiment_id: run.experiment_id, solution_repo: run.solution_repo ?? '', tier: run.tier },
+      );
+      return JSON.stringify({ status: 'materialized', ...result });
+    } catch (err) {
+      return JSON.stringify({ status: 'materialize_error', message: errMsg(err) });
+    }
+  }
+
+  async function handleCommitToSolution(input: Record<string, unknown>): Promise<string> {
+    const runId = numOr0(input.run_id);
+    const persona = strOr(input.persona, '');
+    const iteration = numOr0(input.iteration);
+    const subject = strOr(input.subject, '');
+    const files = Array.isArray(input.files) ? (input.files as GitHubFile[]) : [];
+    if (!runId) return invalid('run_id');
+    if (!PERSONA_NAMES.includes(persona as PersonaId)) return invalid('persona');
+    if (!iteration) return invalid('iteration');
+    if (!subject) return invalid('subject');
+    if (files.length === 0) return invalid('files');
+    if (!githubToken) return JSON.stringify({ status: 'config_error', message: 'GITHUB_TOKEN not set' });
+
+    const run = ctx.db.prepare('SELECT solution_repo, solution_slug FROM forge_runs WHERE id = ?').get(runId) as { solution_repo: string | null; solution_slug: string | null } | undefined;
+    if (!run || !run.solution_slug) return JSON.stringify({ status: 'run_not_scaffolded', run_id: runId });
+
+    const client = new GitHubClient({ token: githubToken, org: githubOrg });
+    try {
+      const sha = await client.commitAndPush(`solution-${run.solution_slug}`, files, { subject, persona, iteration });
+      ctx.db.prepare('UPDATE forge_runs SET final_commit_sha = ? WHERE id = ?').run(sha, runId);
+      return JSON.stringify({ status: 'committed', sha });
+    } catch (err) {
+      return JSON.stringify({ status: 'github_error', message: errMsg(err) });
+    }
+  }
+
+  function handleProposeFeaturePromotion(input: Record<string, unknown>): string {
+    if (!ctx.featureCatalog) return JSON.stringify({ status: 'config_error', message: 'FeatureCatalog not wired' });
+    const runId = numOr0(input.run_id);
+    const spec = (input.spec && typeof input.spec === 'object') ? (input.spec as Record<string, unknown>) : null;
+    const payloadPath = strOr(input.payload_path, '');
+    if (!runId) return invalid('run_id');
+    if (!spec) return invalid('spec');
+    if (!payloadPath) return invalid('payload_path');
+
+    const { promotion_id } = ctx.featureCatalog.proposePromotion(spec, payloadPath, runId);
+    return JSON.stringify({ status: 'proposed', promotion_id });
+  }
+
+  async function handleProvisionVercelEnv(input: Record<string, unknown>): Promise<string> {
+    if (!vercelToken || !vercelOrgId) return JSON.stringify({ status: 'config_error', message: 'VERCEL_API_TOKEN / VERCEL_ORG_ID not set' });
+    const projectId = strOr(input.vercel_project_id, '');
+    if (!projectId) return invalid('vercel_project_id');
+    const vars = (input.env_vars && typeof input.env_vars === 'object') ? (input.env_vars as Record<string, string>) : null;
+    if (!vars) return invalid('env_vars');
+    const client = new VercelClient({ token: vercelToken, orgId: vercelOrgId });
+    try {
+      await client.setEnvVars(projectId, vars);
+      return JSON.stringify({ status: 'env_set', keys: Object.keys(vars) });
+    } catch (err) {
+      return JSON.stringify({ status: 'vercel_error', message: errMsg(err) });
+    }
+  }
+
+  async function handleAttachCustomDomain(input: Record<string, unknown>): Promise<string> {
+    if (!vercelToken || !vercelOrgId) return JSON.stringify({ status: 'config_error', message: 'VERCEL_API_TOKEN / VERCEL_ORG_ID not set' });
+    const projectId = strOr(input.vercel_project_id, '');
+    const domain = strOr(input.domain, '');
+    if (!projectId) return invalid('vercel_project_id');
+    if (!domain) return invalid('domain');
+    const client = new VercelClient({ token: vercelToken, orgId: vercelOrgId });
+    try {
+      const result = await client.attachDomain(projectId, domain);
+      return JSON.stringify({ status: 'attached', name: result.name, verified: result.verified });
+    } catch (err) {
+      return JSON.stringify({ status: 'vercel_error', message: errMsg(err) });
+    }
+  }
+
+  function handleSnapshot(input: Record<string, unknown>, persona: PersonaId): string {
+    const runId = numOr0(input.run_id);
+    if (!runId) return invalid('run_id');
+    return JSON.stringify({ status: 'snapshot_recorded', persona, run_id: runId });
+  }
+
+  function handleRecordVerdict(input: Record<string, unknown>): string {
+    const runId = numOr0(input.run_id);
+    const iteration = numOr0(input.iteration);
+    const persona = strOr(input.persona, '');
+    const verdict = (input.verdict && typeof input.verdict === 'object') ? input.verdict : null;
+    if (!runId) return invalid('run_id');
+    if (!iteration) return invalid('iteration');
+    if (!PERSONA_NAMES.includes(persona as PersonaId)) return invalid('persona');
+    if (typeof input.pass !== 'boolean') return invalid('pass');
+    if (!verdict) return invalid('verdict');
+
+    const result = ctx.db.prepare(
+      'INSERT INTO forge_verdicts (run_id, iteration, persona, pass, verdict_json) VALUES (?, ?, ?, ?, ?)'
+    ).run(runId, iteration, persona, input.pass ? 1 : 0, JSON.stringify(verdict));
+    const verdictId = Number(result.lastInsertRowid);
+
+    ctx.bus.publish('forge_t1.verdict.recorded', ctx.moduleId, {
+      run_id: runId, iteration, persona, pass: input.pass, verdict_id: verdictId, verdict,
+    });
+
+    return JSON.stringify({ status: 'recorded', verdict_id: verdictId });
   }
 
   return { definitions, execute };
 }
+
+// --- helpers ---------------------------------------------------------------
+
+function numOr0(v: unknown): number { return typeof v === 'number' && Number.isFinite(v) ? v : 0; }
+function strOr(v: unknown, fallback: string): string { return typeof v === 'string' ? v : fallback; }
+function strOptional(v: unknown): string | undefined { return typeof v === 'string' && v.length > 0 ? v : undefined; }
+function invalid(field: string): string { return JSON.stringify({ status: 'invalid_input', field }); }
+function errMsg(e: unknown): string { return e instanceof Error ? e.message : String(e); }
