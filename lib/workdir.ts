@@ -1,0 +1,118 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+
+export interface WorkdirFile {
+  path: string;     // RELATIVE path inside the workdir; no leading slash, no ..
+  content: string;
+}
+
+export interface ShellResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  durationMs: number;
+}
+
+export interface ShellOpts {
+  timeoutMs: number;        // hard kill after this
+  env?: Record<string, string>;
+}
+
+/**
+ * A per-build local clone of a solution repo. The coordinator constructs
+ * one at scaffold time (via Workdir.cloneRepo) and reuses it across
+ * iterations. Tools write into it; the sandbox runs commands in it;
+ * commit_to_solution commits + pushes from it.
+ */
+export class Workdir {
+  constructor(private readonly root: string) {
+    if (!path.isAbsolute(root)) {
+      throw new Error(`Workdir root must be absolute (got "${root}")`);
+    }
+    fs.mkdirSync(root, { recursive: true });
+  }
+
+  static async cloneRepo(httpsUrl: string, root: string, token: string): Promise<Workdir> {
+    // Clone with an embedded token. The clone URL is rewritten so the token
+    // appears in the local .git/config but never in any process arg list.
+    const authenticatedUrl = httpsUrl.replace('https://', `https://x-access-token:${token}@`);
+    const wd = new Workdir(root);
+    const r = await wd.runShellOutsideRoot(`git clone --depth 1 ${shellQuote(authenticatedUrl)} ${shellQuote(root)}`, { timeoutMs: 60_000 });
+    if (r.exitCode !== 0) throw new Error(`git clone failed: ${r.stderr.slice(-500)}`);
+    return wd;
+  }
+
+  get path(): string { return this.root; }
+
+  async writeFiles(files: WorkdirFile[]): Promise<void> {
+    for (const f of files) {
+      if (path.isAbsolute(f.path)) throw new Error(`writeFiles: path must be relative (got absolute "${f.path}")`);
+      const resolved = path.resolve(this.root, f.path);
+      if (!resolved.startsWith(this.root + path.sep) && resolved !== this.root) {
+        throw new Error(`writeFiles: path traversal blocked ("${f.path}" → "${resolved}")`);
+      }
+      fs.mkdirSync(path.dirname(resolved), { recursive: true });
+      fs.writeFileSync(resolved, f.content, 'utf-8');
+    }
+  }
+
+  async runShell(cmd: string, opts: ShellOpts): Promise<ShellResult> {
+    return this.runShellAt(this.root, cmd, opts);
+  }
+
+  private async runShellOutsideRoot(cmd: string, opts: ShellOpts): Promise<ShellResult> {
+    return this.runShellAt(process.cwd(), cmd, opts);
+  }
+
+  private async runShellAt(cwd: string, cmd: string, opts: ShellOpts): Promise<ShellResult> {
+    return new Promise<ShellResult>(resolve => {
+      const started = Date.now();
+      const child = spawn('bash', ['-lc', cmd], {
+        cwd,
+        env: { ...process.env, ...(opts.env ?? {}) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '', stderr = '';
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { child.kill('SIGKILL'); } catch { /* already exited */ }
+      }, opts.timeoutMs);
+      child.stdout.on('data', d => { stdout += d.toString(); if (stdout.length > 100_000) stdout = stdout.slice(-100_000); });
+      child.stderr.on('data', d => { stderr += d.toString(); if (stderr.length > 100_000) stderr = stderr.slice(-100_000); });
+      child.on('close', code => {
+        clearTimeout(timer);
+        resolve({
+          exitCode: code ?? -1,
+          stdout, stderr,
+          timedOut,
+          durationMs: Date.now() - started,
+        });
+      });
+    });
+  }
+
+  async stageCommitPush(message: string): Promise<string> {
+    const add = await this.runShell('git add -A', { timeoutMs: 30_000 });
+    if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
+    const commit = await this.runShell(`git -c user.email=forge-t1@thefactoryorg.dev -c user.name="Forge T1" commit -m ${shellQuote(message)}`, { timeoutMs: 30_000 });
+    if (commit.exitCode !== 0 && !commit.stdout.includes('nothing to commit')) {
+      throw new Error(`git commit failed: ${commit.stderr}`);
+    }
+    const push = await this.runShell('git push origin HEAD', { timeoutMs: 60_000 });
+    if (push.exitCode !== 0) throw new Error(`git push failed: ${push.stderr}`);
+    const sha = await this.runShell('git rev-parse HEAD', { timeoutMs: 10_000 });
+    return sha.stdout.trim();
+  }
+
+  async listFiles(): Promise<string[]> {
+    const r = await this.runShell('git ls-files', { timeoutMs: 10_000 });
+    return r.stdout.split('\n').filter(l => l.trim().length > 0);
+  }
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
