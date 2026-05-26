@@ -41,7 +41,9 @@ function makeContext(): {
       solution_slug TEXT,
       final_commit_sha TEXT,
       preview_url TEXT,
-      pending_escalation_id INTEGER
+      pending_escalation_id INTEGER,
+      cost_usd_cap REAL,
+      persona_started_at TEXT
     );
     CREATE TABLE forge_verdicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +283,27 @@ describe('ForgeT1Coordinator', () => {
     expect(env.published.map(p => p.type)).toContain('forge_t1.iteration.completed');
     expect(env.published.map(p => p.type)).toContain('forge_t1.iteration.started');
     expect(env.published.map(p => p.type)).toContain('forge_t1.persona.builder.requested');
+  });
+
+  it('pauses with cost_exceeded when summed agent_runs cost > cap', () => {
+    env.db.exec(`CREATE TABLE agent_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      module_id TEXT NOT NULL,
+      pipeline_session_id TEXT,
+      cost_usd REAL NOT NULL DEFAULT 0
+    )`);
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    // Seed cap = $1 (override default) and burn $1.50.
+    env.db.prepare('UPDATE forge_runs SET cost_usd_cap = 1.0 WHERE id = ?').run(runId);
+    env.db.prepare(
+      "INSERT INTO agent_runs (module_id, pipeline_session_id, cost_usd) VALUES ('forge-t1', 'exp-foo', 1.5)"
+    ).run();
+    env.published.length = 0;
+    env.handlers.get('forge_t1.verdict.recorded')!(verdictEvent(runId, 1, 'builder', true));
+    const row = env.db.prepare('SELECT status FROM forge_runs WHERE id = ?').get(runId) as { status: string };
+    expect(row.status).toBe('paused:cost');
+    expect(env.published.map(p => p.type)).toContain('forge_t1.build.cost_exceeded');
   });
 
   it('pass=false at iteration cap pauses with forge_t1.build.maxiter_reached', () => {

@@ -53,6 +53,20 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     ).run(tier, experimentId, planId);
     const runId = Number(result.lastInsertRowid);
 
+    // R9 (2026-05-25 dry-run): the brief now carries two separate budget fields.
+    // - build_cost_cap_usd caps Claude API spend for THIS build (defaults $20).
+    // - monthly_ops_cap_usd caps server/Vercel runtime cost and is informational only —
+    //   we do NOT use it as a build-run cap (doing so falsely paused PRDs with low ops budgets).
+    // Backward-compat: if the older monthly_soft_cap_usd field is present and the new
+    // build_cost_cap_usd is absent, fall back to it.
+    const budget = p.budget as { build_cost_cap_usd?: number; monthly_ops_cap_usd?: number; monthly_soft_cap_usd?: number } | undefined;
+    const explicit = typeof budget?.build_cost_cap_usd === 'number' && budget.build_cost_cap_usd > 0
+      ? budget.build_cost_cap_usd : undefined;
+    const legacy   = typeof budget?.monthly_soft_cap_usd === 'number' && budget.monthly_soft_cap_usd > 0
+      ? budget.monthly_soft_cap_usd : undefined;
+    const costCap  = explicit ?? legacy ?? 20; // default $20/build
+    db.prepare('UPDATE forge_runs SET cost_usd_cap = ? WHERE id = ?').run(costCap, runId);
+
     bus.publish('forge_t1.build.started', moduleId, { run_id: runId, experiment_id: experimentId, plan_id: planId });
 
     const slug = deriveSlug(experimentId, p);
@@ -84,6 +98,10 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     const pass = p.pass === true || p.pass === 1;
     if (!runId || !persona) return;
 
+    // Cost guard runs before state transitions. If cap exceeded, the run was
+    // paused and we stop processing this verdict — operator J&J will resume.
+    if (checkCostCap(runId)) return;
+
     const run = db.prepare('SELECT * FROM forge_runs WHERE id = ?').get(runId) as ForgeRunRow | undefined;
     if (!run) return;
 
@@ -91,6 +109,53 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
       handlePass(run, persona, iteration);
     } else {
       handleFail(run, persona, iteration);
+    }
+  }
+
+  /**
+   * Returns true if the cost cap was exceeded (and the run was transitioned
+   * to paused:cost). The caller should return immediately.
+   *
+   * Sums agent_runs.cost_usd for this build via the experiment_id link
+   * (kernel's TraceRecorder writes cost_usd on completeRun).
+   */
+  function checkCostCap(runId: number): boolean {
+    // Skip silently if agent_runs table is not present (test fixtures without
+    // the full kernel schema). Real kernel always has it (migration 001).
+    try {
+      const r = db.prepare(
+        `SELECT cost_usd_cap,
+                COALESCE((
+                  SELECT SUM(cost_usd) FROM agent_runs
+                   WHERE module_id = 'forge-t1'
+                     AND pipeline_session_id IN (
+                       SELECT experiment_id FROM forge_runs WHERE id = ?
+                     )
+                ), 0) AS spent
+         FROM forge_runs WHERE id = ?`
+      ).get(runId, runId) as { cost_usd_cap: number | null; spent: number } | undefined;
+      if (!r || !r.cost_usd_cap) return false;
+      if (r.spent < r.cost_usd_cap) return false;
+
+      db.prepare("UPDATE forge_runs SET status = 'paused:cost', paused_at = datetime('now'), current_stage = NULL WHERE id = ?").run(runId);
+      bus.publish('forge_t1.build.cost_exceeded', moduleId, {
+        run_id: runId,
+        spent_usd: r.spent,
+        cap_usd: r.cost_usd_cap,
+      });
+      // Gate on J&J — operator can raise cap and resume, or cancel.
+      const check = escalation.checkAndProceed(
+        moduleId,
+        'build_continue', // reuse the maxiter J&J rule
+        `Build ${runId} exceeded cost cap ($${r.spent.toFixed(2)} / $${r.cost_usd_cap.toFixed(2)})`,
+        { run_id: runId, spent_usd: r.spent, cap_usd: r.cost_usd_cap },
+        escalationRules,
+        null, null,
+      );
+      db.prepare('UPDATE forge_runs SET pending_escalation_id = ? WHERE id = ?').run(check.escalationId ?? null, runId);
+      return true;
+    } catch {
+      return false; // agent_runs table missing → no cost data → skip cap.
     }
   }
 
