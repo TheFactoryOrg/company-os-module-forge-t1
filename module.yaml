@@ -9,8 +9,9 @@ description: |
 
 active: true
 
-subscriptions:
-  - "forge_t1.build.requested"
+# Multi-persona: subscriptions live per-persona below; top-level subscriptions
+# must be empty (module-registry validator enforces this).
+subscriptions: []
 
 credentials:
   - GITHUB_TOKEN
@@ -20,3 +21,29 @@ credentials:
 agent:
   model: claude-sonnet-4-6
   max_turns: 120
+
+personas:
+  - id: builder
+    subscriptions:
+      - "forge_t1.persona.builder.requested"
+      - "forge_t1.persona.promotion_review.requested"
+
+  - id: quality
+    subscriptions:
+      - "forge_t1.persona.quality.requested"
+
+  - id: security
+    subscriptions:
+      - "forge_t1.persona.security.requested"
+
+  - id: ci_cd
+    subscriptions:
+      - "forge_t1.persona.ci_cd.requested"
+
+  - id: critic
+    subscriptions:
+      - "forge_t1.persona.critic.requested"
+
+  - id: tester
+    subscriptions:
+      - "forge_t1.persona.tester.requested"
