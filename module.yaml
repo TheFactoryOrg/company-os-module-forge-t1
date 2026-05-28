@@ -15,6 +15,9 @@ subscriptions: []
 
 credentials:
   - GITHUB_TOKEN
+  # The Vercel creds below are skipped when FORGE_VERCEL_DISABLED=1.
+  # In that mode, provision_vercel_env / attach_custom_domain return
+  # { status: 'skipped' } instead of attempting a Vercel call.
   - VERCEL_API_TOKEN
   - VERCEL_ORG_ID
 

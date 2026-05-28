@@ -534,6 +534,9 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
   }
 
   async function handleProvisionVercelEnv(input: Record<string, unknown>): Promise<string> {
+    if (process.env.FORGE_VERCEL_DISABLED === '1') {
+      return JSON.stringify({ status: 'skipped', reason: 'vercel_disabled' });
+    }
     const runId = numOr0(input.run_id);
     const vars = (input.env_vars && typeof input.env_vars === 'object') ? (input.env_vars as Record<string, string>) : null;
     if (!vars) return invalid('env_vars');
@@ -570,6 +573,9 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
   }
 
   async function handleAttachCustomDomain(input: Record<string, unknown>): Promise<string> {
+    if (process.env.FORGE_VERCEL_DISABLED === '1') {
+      return JSON.stringify({ status: 'skipped', reason: 'vercel_disabled' });
+    }
     const runId = numOr0(input.run_id);
     if (runId) {
       const run = ctx.db.prepare('SELECT local FROM forge_runs WHERE id = ?').get(runId) as { local: number } | undefined;
