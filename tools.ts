@@ -411,8 +411,41 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
     if (!intent) return invalid('intent');
     if (!solutionPath) return invalid('solution_path');
 
-    const run = ctx.db.prepare('SELECT experiment_id, solution_repo, tier FROM forge_runs WHERE id = ?').get(runId) as { experiment_id: string; solution_repo: string | null; tier: string } | undefined;
+    const run = ctx.db.prepare(
+      'SELECT experiment_id, solution_repo, solution_slug, local, tier FROM forge_runs WHERE id = ?'
+    ).get(runId) as { experiment_id: string; solution_repo: string | null; solution_slug: string | null; local: number; tier: string } | undefined;
     if (!run) return JSON.stringify({ status: 'run_not_found', run_id: runId });
+
+    // Scaffold gate. Without scaffold completion there is no workdir to
+    // write into; materialize() resolves relative paths against process.cwd()
+    // (= the orchestrator's own repo root in production). Refuse cleanly so
+    // the agent records pass:false instead of clobbering the host tree.
+    if (!run.solution_repo && !run.solution_slug) {
+      return JSON.stringify({
+        status: 'scaffold_required',
+        message: 'scaffold_solution_repo must succeed before pull_feature. If scaffold returned an error, record_verdict(pass:false) and stop.',
+        run_id: runId,
+      });
+    }
+
+    // Path containment. The agent supplies solution_path as a relative
+    // location inside the per-run workdir. Reject absolute paths and
+    // anything that resolves outside the workdir (../traversal).
+    const isLocal = run.local === 1;
+    const workdirRoot = isLocal
+      ? (run.solution_slug ? localWorkdirPath(run.solution_slug) : null)
+      : workdirPath(run.experiment_id);
+    if (!workdirRoot) {
+      return JSON.stringify({ status: 'scaffold_required', message: 'no workdir root resolvable', run_id: runId });
+    }
+    if (path.isAbsolute(solutionPath)) {
+      return JSON.stringify({ status: 'invalid_path', message: `solution_path must be relative to the workdir; got absolute path "${solutionPath}"` });
+    }
+    const resolved = path.resolve(workdirRoot, solutionPath);
+    const rootWithSep = workdirRoot.endsWith(path.sep) ? workdirRoot : workdirRoot + path.sep;
+    if (resolved !== workdirRoot && !resolved.startsWith(rootWithSep)) {
+      return JSON.stringify({ status: 'invalid_path', message: `solution_path "${solutionPath}" resolves outside the workdir (${resolved})` });
+    }
 
     const subs = (input.substitutions && typeof input.substitutions === 'object')
       ? (input.substitutions as Record<string, string>)
@@ -420,7 +453,7 @@ export function createForgeT1Tools(ctx: ModuleToolContext): ModuleTools {
 
     try {
       const result = await ctx.featureCatalog.materialize(
-        featureId, intent, solutionPath, subs,
+        featureId, intent, resolved, subs,
         { experiment_id: run.experiment_id, solution_repo: run.solution_repo ?? '', tier: run.tier },
       );
       return JSON.stringify({ status: 'materialized', ...result });
