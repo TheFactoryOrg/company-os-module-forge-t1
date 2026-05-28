@@ -39,4 +39,21 @@ describe('Workdir', () => {
     const r = await wd.runShell('sleep 5', { timeoutMs: 200 });
     expect(r.timedOut).toBe(true);
   });
+
+  it('initLocal seeds a default .gitignore', async () => {
+    const target = path.join(baseDir, 'fresh');
+    await Workdir.initLocal(target);
+    const content = fs.readFileSync(path.join(target, '.gitignore'), 'utf-8');
+    expect(content).toContain('node_modules/');
+    expect(content).toContain('.env');
+  });
+
+  it('initLocal preserves an existing .gitignore', async () => {
+    const target = path.join(baseDir, 'has-ignore');
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, '.gitignore'), 'custom-pattern\n');
+    await Workdir.initLocal(target);
+    const content = fs.readFileSync(path.join(target, '.gitignore'), 'utf-8');
+    expect(content).toBe('custom-pattern\n');
+  });
 });

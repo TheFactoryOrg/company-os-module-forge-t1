@@ -41,6 +41,7 @@ export class Workdir {
     const wd = new Workdir(root);
     const r = await wd.runShellOutsideRoot(`git clone --depth 1 ${shellQuote(authenticatedUrl)} ${shellQuote(root)}`, { timeoutMs: 60_000 });
     if (r.exitCode !== 0) throw new Error(`git clone failed: ${r.stderr.slice(-500)}`);
+    wd.seedDefaultGitignore();
     return wd;
   }
 
@@ -56,7 +57,21 @@ export class Workdir {
       const init = await wd.runShell('git init -q -b main', { timeoutMs: 30_000 });
       if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr.slice(-500)}`);
     }
+    wd.seedDefaultGitignore();
     return wd;
+  }
+
+  /**
+   * Write a minimal default .gitignore if none exists. Prevents
+   * Workdir.stageCommitPush's `git add -A` from staging the entire
+   * node_modules tree produced by sandbox (npm install) — that tree
+   * caused `git pack-objects` to OOM-kill in the 2026-05-28 prod E2E.
+   * The agent can still overwrite via writeFiles; this is just the floor.
+   */
+  private seedDefaultGitignore(): void {
+    const p = path.join(this.root, '.gitignore');
+    if (fs.existsSync(p)) return;
+    fs.writeFileSync(p, 'node_modules/\n.env\n', 'utf-8');
   }
 
   get path(): string { return this.root; }
