@@ -383,6 +383,74 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
    * v2 dry-run): emits forge_t1.build.secrets_timeout + J&J via build_continue.
    */
   function runWatchdogSweep(): void {
+    sweepCompletedWithoutVerdict();
+    sweepLongRunning();
+    sweepStalledSecrets();
+  }
+
+  /**
+   * Safety net (2026-05-29): agent loop ended (status='completed'|'failed')
+   * but no record_verdict landed for this iter+persona. Synthesize pass:false
+   * immediately so the iteration advances without waiting 15 minutes for
+   * sweepLongRunning. Cluster B (mandatory record_verdict in agent.md) holds
+   * for iter 1 but slips on later iterations when the agent gets absorbed
+   * in fixing red-tests; this is the durability layer that doesn't trust
+   * agent prompt discipline.
+   *
+   * Correlation: forge_runs has no FK to agent_runs, so we join via
+   * (experiment_id, module_id, trigger_ref, created_at > persona_started_at).
+   * The trigger_ref encodes the persona via `forge_t1.persona.<stage>.requested`.
+   */
+  function sweepCompletedWithoutVerdict(): void {
+    const stuck = db.prepare(
+      `SELECT fr.id, fr.current_stage, fr.iteration_count, fr.persona_started_at,
+              fr.experiment_id, fr.last_sandbox_status, fr.last_sandbox_error
+         FROM forge_runs fr
+        WHERE fr.status LIKE 'running:%'
+          AND fr.current_stage IS NOT NULL
+          AND fr.persona_started_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM agent_runs ar
+             WHERE ar.experiment_id = fr.experiment_id
+               AND ar.module_id = 'forge-t1'
+               AND ar.trigger_ref = 'forge_t1.persona.' || fr.current_stage || '.requested'
+               AND ar.status IN ('completed', 'failed')
+               AND ar.created_at > fr.persona_started_at
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM forge_verdicts fv
+             WHERE fv.run_id = fr.id
+               AND fv.iteration = fr.iteration_count
+               AND fv.persona = fr.current_stage
+          )`
+    ).all() as Array<{
+      id: number; current_stage: string; iteration_count: number;
+      persona_started_at: string; experiment_id: string;
+      last_sandbox_status: string | null; last_sandbox_error: string | null;
+    }>;
+
+    for (const row of stuck) {
+      bus.publish('forge_t1.verdict.recorded', moduleId, {
+        run_id: row.id,
+        iteration: row.iteration_count,
+        persona: row.current_stage,
+        pass: false,
+        verdict: {
+          notes: 'agent_run_completed_no_verdict',
+          stage_started_at: row.persona_started_at,
+          last_sandbox_status: row.last_sandbox_status,
+          last_sandbox_error: (row.last_sandbox_error ?? '').slice(0, 400),
+        },
+      });
+    }
+  }
+
+  /**
+   * Long-running watchdog: persona has been in flight > 15 minutes without
+   * a record_verdict. Backstop for edge cases that sweepCompletedWithoutVerdict
+   * misses — runner crash before trace status update, kernel race, etc.
+   */
+  function sweepLongRunning(): void {
     const stuck = db.prepare(
       `SELECT id, current_stage, iteration_count, persona_started_at
          FROM forge_runs
@@ -409,12 +477,16 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
         verdict: { notes: 'watchdog_timeout', stage_started_at: row.persona_started_at },
       });
     }
+  }
 
-    // S5 (N6 from v2 dry-run): secrets-timeout sweep — builds in ready_pending_secrets
-    // for >24h need operator attention. Without this, a forgotten provision step
-    // strands the build (and blocks the dispatcher queue since the run is still
-    // in ACTIVE_STATUSES). 24h is the default; in production the threshold could
-    // come from module.yaml config.
+  /**
+   * S5 (N6 from v2 dry-run): secrets-timeout sweep — builds in
+   * ready_pending_secrets > 24h need operator attention. Without this, a
+   * forgotten provision step strands the build (and blocks the dispatcher
+   * queue since the run is still in ACTIVE_STATUSES). 24h is the default;
+   * in production the threshold could come from module.yaml config.
+   */
+  function sweepStalledSecrets(): void {
     const stalledSecrets = db.prepare(
       `SELECT id, experiment_id, ready_pending_secrets_at
          FROM forge_runs

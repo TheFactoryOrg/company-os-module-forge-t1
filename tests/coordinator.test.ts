@@ -73,6 +73,27 @@ function makeContext(): {
       status TEXT NOT NULL DEFAULT 'pending',
       proposed_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- agent_runs is owned by the kernel (src/agent/trace.ts) but the
+    -- coordinator's safety net (sweepCompletedWithoutVerdict) reads it,
+    -- and the cost-cap path reads cost_usd. Columns kept minimal.
+    CREATE TABLE agent_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      module_id TEXT NOT NULL,
+      trigger_type TEXT,
+      trigger_ref TEXT,
+      input_summary TEXT,
+      experiment_id TEXT,
+      pipeline_session_id TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      output_summary TEXT,
+      messages TEXT,
+      tool_calls TEXT,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      duration_ms INTEGER,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
   `);
   const published: PublishCall[] = [];
   const handlers = new Map<string, (e: EventRow) => void>();
@@ -302,6 +323,62 @@ describe('ForgeT1Coordinator', () => {
     expect((synth!.payload as { verdict: { notes: string } }).verdict.notes).toBe('watchdog_timeout');
   });
 
+  it('sweepCompletedWithoutVerdict synthesizes pass:false when agent_run completed without record_verdict', () => {
+    // forge_run in running:builder, persona_started_at 2 min ago (not 15+, so the
+    // long-running sweep would NOT fire — only the new safety net should).
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.db.prepare(
+      "UPDATE forge_runs SET persona_started_at = datetime('now', '-2 minutes'), current_stage = 'builder', status = 'running:builder' WHERE id = ?"
+    ).run(runId);
+    // agent_run completed for builder, after persona_started_at, no forge_verdicts row
+    env.db.prepare(
+      "INSERT INTO agent_runs (module_id, trigger_type, trigger_ref, experiment_id, status, created_at) VALUES ('forge-t1', 'event', 'forge_t1.persona.builder.requested', 'exp-foo', 'completed', datetime('now', '-30 seconds'))"
+    ).run();
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    const synth = env.published.find(p => p.type === 'forge_t1.verdict.recorded');
+    expect(synth).toBeTruthy();
+    expect((synth!.payload as { pass: boolean }).pass).toBe(false);
+    expect((synth!.payload as { verdict: { notes: string } }).verdict.notes).toBe('agent_run_completed_no_verdict');
+  });
+
+  it('sweepCompletedWithoutVerdict skips when a forge_verdicts row already exists', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.db.prepare(
+      "UPDATE forge_runs SET persona_started_at = datetime('now', '-2 minutes'), current_stage = 'builder', status = 'running:builder' WHERE id = ?"
+    ).run(runId);
+    env.db.prepare(
+      "INSERT INTO agent_runs (module_id, trigger_type, trigger_ref, experiment_id, status, created_at) VALUES ('forge-t1', 'event', 'forge_t1.persona.builder.requested', 'exp-foo', 'completed', datetime('now', '-30 seconds'))"
+    ).run();
+    // Pre-populate the verdict row — safety net should skip.
+    env.db.prepare(
+      "INSERT INTO forge_verdicts (run_id, iteration, persona, pass, verdict_json) VALUES (?, ?, 'builder', 1, '{}')"
+    ).run(runId, (env.db.prepare('SELECT iteration_count FROM forge_runs WHERE id = ?').get(runId) as { iteration_count: number }).iteration_count);
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    expect(env.published.find(p => p.type === 'forge_t1.verdict.recorded')).toBeUndefined();
+  });
+
+  it('sweepCompletedWithoutVerdict skips when the agent_run is still running', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.db.prepare(
+      "UPDATE forge_runs SET persona_started_at = datetime('now', '-2 minutes'), current_stage = 'builder', status = 'running:builder' WHERE id = ?"
+    ).run(runId);
+    // agent_run is still running — not a terminal status.
+    env.db.prepare(
+      "INSERT INTO agent_runs (module_id, trigger_type, trigger_ref, experiment_id, status, created_at) VALUES ('forge-t1', 'event', 'forge_t1.persona.builder.requested', 'exp-foo', 'running', datetime('now', '-30 seconds'))"
+    ).run();
+    env.published.length = 0;
+    const coord = createForgeT1Coordinator(env.ctx);
+    coord.runWatchdogSweep();
+    expect(env.published.find(p => p.type === 'forge_t1.verdict.recorded')).toBeUndefined();
+  });
+
   it('runWatchdogSweep emits secrets_timeout for builds stuck in ready_pending_secrets >24h (S5)', () => {
     env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
     const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
@@ -329,12 +406,7 @@ describe('ForgeT1Coordinator', () => {
   });
 
   it('pauses with cost_exceeded when summed agent_runs cost > cap', () => {
-    env.db.exec(`CREATE TABLE agent_runs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      module_id TEXT NOT NULL,
-      pipeline_session_id TEXT,
-      cost_usd REAL NOT NULL DEFAULT 0
-    )`);
+    // agent_runs now provided by the test harness — no per-test create.
     env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
     const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
     // Seed cap = $1 (override default) and burn $1.50.
