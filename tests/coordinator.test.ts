@@ -8,7 +8,7 @@ import type {
   EventRow,
 } from '../types.js';
 
-interface PublishCall { type: string; payload: Record<string, unknown> }
+interface PublishCall { type: string; payload: Record<string, unknown>; opts?: { experimentId?: string | null } }
 
 function makeContext(): {
   ctx: CoordinatorContext;
@@ -98,8 +98,8 @@ function makeContext(): {
   const published: PublishCall[] = [];
   const handlers = new Map<string, (e: EventRow) => void>();
   const bus: CoordinatorEventBus = {
-    publish(type, _src, payload) {
-      published.push({ type, payload });
+    publish(type, _src, payload, opts) {
+      published.push({ type, payload, opts });
       return published.length;
     },
     subscribe(pattern, _moduleId, handler) {
@@ -180,6 +180,27 @@ describe('ForgeT1Coordinator', () => {
     expect(env.published.map(p => p.type)).toContain('forge_t1.build.started');
     expect(env.published.map(p => p.type)).toContain('forge_t1.iteration.started');
     expect(env.published.map(p => p.type)).toContain('forge_t1.persona.builder.requested');
+  });
+
+  it('persona.builder.requested carries experimentId in opts (so trace recorder writes agent_runs.experiment_id)', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const evt = env.published.find(p => p.type === 'forge_t1.persona.builder.requested');
+    expect(evt).toBeTruthy();
+    // Safety net (sweepCompletedWithoutVerdict) requires ar.experiment_id = fr.experiment_id.
+    // The opts.experimentId is what makes that happen — the event-bus writes it into
+    // events.experiment_id, then app.ts threads it into runner.run, then trace.ts writes
+    // it onto agent_runs.experiment_id.
+    expect(evt!.opts?.experimentId).toBe('exp-foo');
+  });
+
+  it('persona.<next>.requested carries experimentId in opts (Builder → Quality transition)', () => {
+    env.handlers.get('forge_t1.build.requested')!(buildRequestedEvent());
+    const runId = (env.db.prepare('SELECT id FROM forge_runs LIMIT 1').get() as { id: number }).id;
+    env.published.length = 0;
+    env.handlers.get('forge_t1.verdict.recorded')!(verdictEvent(runId, 1, 'builder', true));
+    const evt = env.published.find(p => p.type === 'forge_t1.persona.quality.requested');
+    expect(evt).toBeTruthy();
+    expect(evt!.opts?.experimentId).toBe('exp-foo');
   });
 
   it('stays in pending when escalation returns proceed=false', () => {

@@ -47,7 +47,12 @@ export interface EventRow {
  * subscriptions are declared in module.yaml and wired by the kernel.
  */
 export interface MinimalEventBus {
-  publish(type: string, sourceModule: string, payload: Record<string, unknown>): number;
+  publish(
+    type: string,
+    sourceModule: string,
+    payload: Record<string, unknown>,
+    opts?: { experimentId?: string | null },
+  ): number;
   getRecentEvents(limit: number): Array<{
     type: string;
     source_module: string;

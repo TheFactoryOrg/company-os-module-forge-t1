@@ -221,7 +221,15 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     if (persona === 'tester') {
       db.prepare("UPDATE forge_runs SET status = 'running:promotion_review', current_stage = 'promotion_review', persona_started_at = datetime('now') WHERE id = ?").run(run.id);
       bus.publish('forge_t1.iteration.completed', moduleId, { run_id: run.id, iteration, pass: true });
-      bus.publish('forge_t1.persona.promotion_review.requested', moduleId, { run_id: run.id, experiment_id: run.experiment_id });
+      // experimentId opt is required so the trace recorder writes it onto
+      // the resulting agent_run row (the safety net in runWatchdogSweep
+      // joins via agent_runs.experiment_id = forge_runs.experiment_id).
+      bus.publish(
+        'forge_t1.persona.promotion_review.requested',
+        moduleId,
+        { run_id: run.id, experiment_id: run.experiment_id },
+        { experimentId: run.experiment_id },
+      );
       return;
     }
 
@@ -229,7 +237,12 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     const next = PERSONA_SEQUENCE[idx + 1];
     if (!next) return;
     db.prepare("UPDATE forge_runs SET status = ?, current_stage = ?, persona_started_at = datetime('now') WHERE id = ?").run(`running:${next}`, next, run.id);
-    bus.publish(`forge_t1.persona.${next}.requested`, moduleId, { run_id: run.id, experiment_id: run.experiment_id, iteration });
+    bus.publish(
+      `forge_t1.persona.${next}.requested`,
+      moduleId,
+      { run_id: run.id, experiment_id: run.experiment_id, iteration },
+      { experimentId: run.experiment_id },
+    );
   }
 
   function handleFail(run: ForgeRunRow, persona: PersonaId, iteration: number): void {
@@ -263,8 +276,19 @@ export function createForgeT1Coordinator(ctx: CoordinatorContext): Coordinator {
     db.prepare(
       "UPDATE forge_runs SET status = 'running:builder', current_stage = 'builder', iteration_count = ?, persona_started_at = datetime('now'), last_sandbox_status = NULL, last_sandbox_error = NULL WHERE id = ?"
     ).run(iter, runId);
+    // experimentId opt → trace recorder stores it onto agent_runs.experiment_id,
+    // which the safety-net watchdog joins against.
+    const expRow = db
+      .prepare('SELECT experiment_id FROM forge_runs WHERE id = ?')
+      .get(runId) as { experiment_id: string } | undefined;
+    const experimentId = expRow?.experiment_id ?? null;
     bus.publish('forge_t1.iteration.started', moduleId, { run_id: runId, iteration: iter });
-    bus.publish('forge_t1.persona.builder.requested', moduleId, { run_id: runId, iteration: iter });
+    bus.publish(
+      'forge_t1.persona.builder.requested',
+      moduleId,
+      { run_id: runId, iteration: iter, experiment_id: experimentId },
+      { experimentId },
+    );
   }
 
   function cancel(runId: number, reason: string): void {
